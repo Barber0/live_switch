@@ -22,6 +22,10 @@ func NewReadWriter(rw io.ReadWriter) *ReadWriter {
 	}
 }
 
+func (rw *ReadWriter) Read(bts []byte) (int, error) {
+	return io.ReadAtLeast(rw.ReadWriter, bts, len(bts))
+}
+
 func (rw *ReadWriter) ReadUint32BE(size int) (uint32, error) {
 	bs4 := make([]byte, 4)
 	_, err := rw.Read(bs4[4-size:])

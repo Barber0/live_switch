@@ -12,12 +12,14 @@ type streamReader interface {
 var _ streamReader = &videoReader{}
 
 type videoReader struct {
-	conn *connection
+	conn      *connection
+	tagParser *video.TagParser
 }
 
 func NewVideoReader(conn *connection) *videoReader {
 	r := &videoReader{
-		conn: conn,
+		conn:      conn,
+		tagParser: &video.TagParser{},
 	}
 	return r
 }
@@ -43,12 +45,10 @@ GET_CH:
 		case TYPE_ID_DATA_MSG_AMF0, TYPE_ID_DATA_MSG_AMF3:
 			p.DataType = video.DATA_TYPE_META
 			break GET_CH
-			//default:
-			//	return fmt.Errorf("invalid chunk type: %d", ch.typeId)
 		}
 	}
 	p.StreamId = ch.streamId
 	p.Data = ch.data
 	p.Timestamp = ch.timestamp
-	return nil
+	return v.tagParser.Parse(p)
 }

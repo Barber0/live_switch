@@ -1,19 +1,20 @@
 package rtmp
 
 import (
-	"bufio"
 	"bytes"
 	"encoding/binary"
 	"errors"
-	"fmt"
+	"github.com/sirupsen/logrus"
 	"live/src/utils"
 	"net"
+	"runtime/debug"
 	"sync"
 	"time"
 )
 
 type connection struct {
 	tcpConn         net.Conn
+	rw              *utils.ReadWriter
 	chunkSize       uint32
 	remoteChunkSize uint32
 	windowAckSize   uint32
@@ -37,6 +38,7 @@ type publishInfo struct {
 func newConn(c net.Conn) *connection {
 	conn := &connection{
 		tcpConn:         c,
+		rw:              utils.NewReadWriter(c),
 		chunkSize:       128,
 		remoteChunkSize: 128,
 		windowAckSize:   2500000,
@@ -140,57 +142,43 @@ func (c *connection) handshake() (err error) {
 }
 
 func (c *connection) readMsg() (retCh *chunk, err error) {
-	defer func() {
-		c.prevCh = *retCh
-	}()
+	defer utils.HandlePanic(func(err error) {
+		logrus.Errorf("read msg failed, err: %v\nstack: %s", err, debug.Stack())
+	})
 	var ch *chunk
 	for {
-		bs1 := c.pool.Get(1)
-		_, err = c.tcpConn.Read(*bs1)
+		var fmtAndCsid byte
+		fmtAndCsid, err = c.rw.ReadByte()
 		if err != nil {
 			return
 		}
-
-		tmpFmt := (*bs1)[0] >> 6
-
-		csid1 := (*bs1)[0] & 0x3f
-		c.pool.ResetByBsp(bs1)
-
+		tmpFmt := fmtAndCsid >> 6
+		csid1 := fmtAndCsid & 0x3f
 		var ok bool
-		if ch, ok = c.chunkMap[csid1]; !ok || ch.finished {
+		if ch, ok = c.chunkMap[csid1]; !ok {
 			ch = &chunk{}
 			c.chunkMap[csid1] = ch
 		}
+		ch.tmpFmt = tmpFmt
 
 		switch csid1 {
 		case 0:
-			_, err = c.tcpConn.Read(*bs1)
+			var csid2 byte
+			csid2, err = c.rw.ReadByte()
 			if err != nil {
 				return
 			}
-			ch.csid = uint32((*bs1)[0]) + 64
-			c.pool.ResetByBsp(bs1)
+			ch.csid = uint32(csid2) + 64
 		case 1:
-			bs4 := c.pool.Get(4)
-			_, err = c.tcpConn.Read((*bs4)[:2])
+			var csid2 uint32
+			csid2, err = c.rw.ReadUint32LE(2)
 			if err != nil {
 				return
 			}
-			ch.csid = binary.LittleEndian.Uint32(*bs4) + 64
-			c.pool.ResetByBsp(bs4)
+			ch.csid = csid2 + 64
 		default:
 			ch.csid = uint32(csid1)
 		}
-
-		if csid1 > 4 || csid1 < 2 {
-			fmt.Println("test point")
-		}
-
-		if ch.csid > 4 || ch.csid < 2 {
-			fmt.Println("test point1")
-		}
-
-		ch.basicHeader.tmpFmt = tmpFmt
 
 		if err = c.readChunk(ch); err != nil {
 			return
@@ -198,7 +186,6 @@ func (c *connection) readMsg() (retCh *chunk, err error) {
 
 		if ch.finished {
 			retCh = ch
-			//delete(c.chunkMap, csid1)
 			return
 		}
 	}
@@ -209,85 +196,110 @@ func (c *connection) readChunk(ch *chunk) (err error) {
 		return errors.New("message finished, but still have remain data")
 	}
 
-	bs4 := c.pool.Get(4)
-
-	if ch.tmpFmt < 3 {
+	switch ch.tmpFmt {
+	case 0:
 		ch.format = ch.tmpFmt
+		ch.timestamp, err = c.rw.ReadUint32BE(3)
+		utils.CheckErr(err)
+		ch.length, err = c.rw.ReadUint32BE(3)
+		utils.CheckErr(err)
+		ch.typeId, err = c.rw.ReadByte()
+		utils.CheckErr(err)
+		ch.streamId, err = c.rw.ReadUint32LE(4)
+		utils.CheckErr(err)
+		ch.timestamp, err = c.readExtTimestamp(ch, ch.timestamp)
+		utils.CheckErr(err)
+		ch.newData()
+	case 1:
+		ch.format = ch.tmpFmt
+		ts, err := c.rw.ReadUint32BE(3)
+		utils.CheckErr(err)
+		ch.length, err = c.rw.ReadUint32BE(3)
+		utils.CheckErr(err)
+		ch.typeId, err = c.rw.ReadByte()
+		utils.CheckErr(err)
+		ts, err = c.readExtTimestamp(ch, ts)
+		utils.CheckErr(err)
 
-		_, err = c.tcpConn.Read((*bs4)[1:])
-		if err != nil {
-			return
-		}
-		ch.timestamp += binary.BigEndian.Uint32(*bs4)
-		c.pool.ResetByBsp(bs4)
+		ch.timeIncr = ts
+		ch.timestamp += ts
+		ch.newData()
+	case 2:
+		ch.format = ch.tmpFmt
+		ts, err := c.rw.ReadUint32BE(3)
+		utils.CheckErr(err)
+		ts, err = c.readExtTimestamp(ch, ts)
+		utils.CheckErr(err)
 
-		if ch.tmpFmt < 2 {
-			if _, err = c.tcpConn.Read(*bs4); err != nil {
-				return
-			}
-			lenAndTypeId := binary.BigEndian.Uint32(*bs4)
-			ch.length = lenAndTypeId >> 8
-
-			if ch.length > c.remoteChunkSize {
-				fmt.Println("too long")
-			}
-
-			ch.typeId = byte(lenAndTypeId & 0xff)
-
-			ch.data = make([]byte, ch.length)
-			ch.index = 0
-			ch.remain = ch.length
-			c.pool.ResetByBsp(bs4)
-
-			if ch.tmpFmt < 1 {
-				if _, err = c.tcpConn.Read(*bs4); err != nil {
-					return
+		ch.timeIncr = ts
+		ch.timestamp += ts
+		ch.newData()
+	case 3:
+		if ch.remain == 0 {
+			switch ch.format {
+			case 0:
+				if ch.hasExtTs {
+					ch.timestamp, err = c.rw.ReadUint32BE(4)
+					utils.CheckErr(err)
 				}
-				ch.streamId = binary.LittleEndian.Uint32(*bs4)
-				c.pool.ResetByBsp(bs4)
+			case 1, 2:
+				var timeIncr uint32
+				if ch.hasExtTs {
+					timeIncr, err = c.rw.ReadUint32BE(4)
+					utils.CheckErr(err)
+				} else {
+					timeIncr = ch.timeIncr
+				}
+				ch.timestamp += timeIncr
 			}
-
-			if ch.timestamp == 0xffffff {
-				_, err = c.tcpConn.Read(*bs4)
+			ch.data = make([]byte, ch.length)
+			ch.remain = ch.length
+		} else {
+			if ch.hasExtTs {
+				var bts []byte
+				bts, err = c.rw.Peek(4)
 				if err != nil {
 					return
 				}
-				ch.timestamp = binary.BigEndian.Uint32(*bs4)
-				c.pool.ResetByBsp(bs4)
-				ch.hasExtTs = true
+				tmpts := binary.BigEndian.Uint32(bts)
+				if tmpts == ch.timestamp {
+					c.rw.Discard(4)
+				}
 			}
-		} else {
-			ch.data = make([]byte, ch.length)
 		}
 	}
 
-	if ch.hasExtTs {
-		rw := bufio.NewReader(c.tcpConn)
-		var bts []byte
-		bts, err = rw.Peek(4)
-		if err != nil {
-			return err
-		}
-		tmpts := binary.BigEndian.Uint32(bts)
-		if tmpts == ch.timestamp {
-			rw.Discard(4)
-		}
+	size := int(ch.remain)
+	if size > int(c.remoteChunkSize) {
+		size = int(c.remoteChunkSize)
 	}
 
-	size := ch.remain
-	if ch.remain > c.remoteChunkSize {
-		size = c.remoteChunkSize
-	}
-	if _, err = c.tcpConn.Read(ch.data[ch.index : ch.index+int(size)]); err != nil {
+	buf := ch.data[ch.index : ch.index+size]
+	if _, err = c.rw.Read(buf); err != nil {
 		return
 	}
-	ch.index += int(size)
-	ch.remain -= size
+
+	ch.index += size
+	ch.remain -= uint32(size)
 
 	if ch.remain == 0 {
 		ch.finished = true
 	}
 
+	return
+}
+
+func (c *connection) readExtTimestamp(ch *chunk, curTs uint32) (ts uint32, err error) {
+	if curTs == 0xffffff {
+		ts, err = c.rw.ReadUint32BE(4)
+		if err != nil {
+			return
+		}
+		ch.hasExtTs = true
+	} else {
+		ts = curTs
+		ch.hasExtTs = false
+	}
 	return
 }
 
@@ -455,10 +467,10 @@ func (c *connection) writeChunkHeader(ch *chunk) (err error) {
 }
 
 func (c *connection) getPublisherName() (URL string) {
-	if tmpTcUrl, ok := c.connInfo["tcUrl"]; ok {
-		URL = tmpTcUrl.(string) + "/" + c.publishInfo.name
-	} else {
-		URL = c.publishInfo.name
-	}
-	return
+	//if tmpTcUrl, ok := c.connInfo["tcUrl"]; ok {
+	//	URL = tmpTcUrl.(string) + "/" + c.publishInfo.name
+	//} else {
+	//	URL = c.publishInfo.name
+	//}
+	return c.publishInfo.publishType + "/" + c.publishInfo.name
 }

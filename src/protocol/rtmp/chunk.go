@@ -18,6 +18,7 @@ type basicHeader struct {
 
 type messageHeader struct {
 	timestamp uint32
+	timeIncr  uint32
 	length    uint32
 	typeId    byte
 	streamId  uint32
@@ -55,4 +56,11 @@ func newChunk(typeId byte, csid, streamId uint32, data []byte) *chunk {
 	}
 
 	return ch
+}
+
+func (ch *chunk) newData() {
+	ch.finished=false
+	ch.index = 0
+	ch.remain = ch.length
+	ch.data = make([]byte, ch.length)
 }

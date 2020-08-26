@@ -1,7 +1,6 @@
 package rtmp
 
 import (
-	"fmt"
 	"live/src/utils"
 	"net"
 	"runtime/debug"
@@ -14,8 +13,7 @@ var publisherMap = cmap.New()
 
 func NewRTMPServer(addr string) {
 	defer utils.HandlePanic(func(err error) {
-		logrus.Error("handle panic, err: ", err)
-		fmt.Println(string(debug.Stack()))
+		logrus.Errorf("handle panic, err: %v\nstack: %s", err, debug.Stack())
 	})
 	tcpAddr, err := net.ResolveTCPAddr("tcp", addr)
 	if err != nil {
@@ -34,14 +32,14 @@ func NewRTMPServer(addr string) {
 		}
 		conn := newConn(tcpConn)
 
-		// go handleConn(conn)
-		handleConn(conn)
+		go handleConn(conn)
+		//handleConn(conn)
 	}
 }
 
 func handleConn(conn *connection, carr ...Consumer) {
 	defer utils.HandlePanic(func(err error) {
-		logrus.Error("conn panic, err: ", err)
+		logrus.Errorf("conn panic, err: %v\n%s", err, debug.Stack())
 		conn.Close()
 	})
 	utils.CheckErr(conn.handshake())
@@ -65,6 +63,5 @@ func handleConn(conn *connection, carr ...Consumer) {
 		publisher.SetReader(NewVideoReader(conn))
 		publisher.AddConsumer(carr...)
 		publisher.Start()
-		fmt.Println(publisher.name)
 	}
 }

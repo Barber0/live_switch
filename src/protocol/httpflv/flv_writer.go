@@ -12,7 +12,7 @@ import (
 
 const (
 	HEADER_LEN    = 11
-	MAX_QUEUE_LEN = 1024
+	MAX_QUEUE_LEN = (1 << 10) * 100
 )
 
 var _ rtmp.Consumer = &FLVWriter{}
@@ -24,6 +24,7 @@ type FLVWriter struct {
 	ctx         http.ResponseWriter
 	buf         []byte
 	closed      bool
+	status      bool
 }
 
 func (fw *FLVWriter) Close() {
@@ -33,6 +34,14 @@ func (fw *FLVWriter) Close() {
 		close(fw.stopChan)
 	}
 	fw.closed = true
+}
+
+func (fw *FLVWriter) GetStatus() bool {
+	return fw.status
+}
+
+func (fw *FLVWriter) SetStatus(v bool) {
+	fw.status = v
 }
 
 func NewFLVWriter(ctx http.ResponseWriter) *FLVWriter {
@@ -68,9 +77,35 @@ func (fw *FLVWriter) Write(p *video.Packet) (err error) {
 		}
 	}()
 
-	fw.packetQueue <- p
-
+	if len(fw.packetQueue) >= MAX_QUEUE_LEN-84 {
+		fw.dropPacket()
+	} else {
+		fw.packetQueue <- p
+	}
 	return
+}
+
+func (fw *FLVWriter) dropPacket() {
+	logrus.Warningf("[%v] packet queue max!!!", fw.Name())
+	for i := 0; i < MAX_QUEUE_LEN-84; i++ {
+		tmpPkt, ok := <-fw.packetQueue
+		if ok {
+
+			if len(fw.packetQueue) > MAX_QUEUE_LEN-10 {
+				<-fw.packetQueue
+			}
+			<-fw.packetQueue
+
+			if tmpPkt.DataType == video.DATA_TYPE_AUDIO {
+				//fw.packetQueue <- tmpPkt
+			}
+		}
+	}
+	logrus.Debug("packet queue len: ", len(fw.packetQueue))
+}
+
+func (fw *FLVWriter) Wait() {
+	<-fw.stopChan
 }
 
 func (fw *FLVWriter) sendPacket() error {
@@ -82,6 +117,7 @@ func (fw *FLVWriter) sendPacket() error {
 			typeID := rtmp.TYPE_ID_VIDEO_MSG
 			switch p.DataType {
 			case video.DATA_TYPE_VIDEO:
+				typeID = rtmp.TYPE_ID_VIDEO_MSG
 			case video.DATA_TYPE_AUDIO:
 				typeID = rtmp.TYPE_ID_AUDIO_MSG
 			case video.DATA_TYPE_META:
@@ -100,7 +136,7 @@ func (fw *FLVWriter) sendPacket() error {
 			timestampBase := timestamp & 0xffffff
 			timestampExt := timestamp >> 24 & 0xff
 
-			binary.BigEndian.PutUint32(hbts, uint32(typeID)<<24|uint32(dataLen))
+			binary.BigEndian.PutUint32(hbts[:4], uint32(typeID)<<24|uint32(dataLen))
 			binary.BigEndian.PutUint32(hbts[4:8], timestampBase<<8|timestampExt)
 
 			if _, err := fw.ctx.Write(hbts); err != nil {

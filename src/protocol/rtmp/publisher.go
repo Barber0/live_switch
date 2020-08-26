@@ -10,11 +10,14 @@ import (
 type Publisher struct {
 	id          string
 	name        string
+	cache       *PacketCache
 	reader      streamReader
 	consumerMap cmap.ConcurrentMap
 }
 
 type Consumer interface {
+	GetStatus() bool
+	SetStatus(v bool)
 	Name() string
 	Write(packet *video.Packet) error
 	Close()
@@ -24,6 +27,7 @@ func newPublisher(name string) *Publisher {
 	p := &Publisher{
 		id:          uuid.NewV4().String(),
 		name:        name,
+		cache:       NewPacketCache(),
 		consumerMap: cmap.New(),
 	}
 	return p
@@ -57,12 +61,23 @@ func (p *Publisher) Start() {
 				return
 			}
 
+			p.cache.Write(pkt)
+
 			for item := range p.consumerMap.IterBuffered() {
-				pub := item.Val.(Consumer)
-				tmpPkt := pkt
-				if err := pub.Write(&tmpPkt); err != nil {
-					logrus.Errorf("consumer[%s] write failed, err: %v", item.Key, err)
-					p.consumerMap.Remove(item.Key)
+				consumer := item.Val.(Consumer)
+				if !consumer.GetStatus() {
+					if err := p.cache.Send(consumer); err != nil {
+						logrus.Errorf("send cache to consumer[%s] failed, err: %v", item.Key, err)
+						p.consumerMap.Remove(item.Key)
+						continue
+					}
+					consumer.SetStatus(true)
+				} else {
+					tmpPkt := pkt
+					if err := consumer.Write(&tmpPkt); err != nil {
+						logrus.Errorf("consumer[%s] write failed, err: %v", item.Key, err)
+						p.consumerMap.Remove(item.Key)
+					}
 				}
 			}
 		}
